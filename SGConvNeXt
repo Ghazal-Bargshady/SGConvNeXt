@@ -1,0 +1,328 @@
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+#os.environ["CUDA_VISIBLE_DEVICES"]='1' 
+import glob
+import pandas as pd
+import numpy as np
+import joblib
+from imutils import paths
+from sklearn.preprocessing import LabelBinarizer
+from tqdm import tqdm
+from ipywidgets import IntProgress
+import gc
+import torchvision
+from torchvision import datasets, models, transforms
+import torch
+import random
+import albumentations
+#from albumentations.pytorch import ToTensorV2
+import matplotlib.pyplot as plt
+import argparse
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import time
+from PIL import Image
+from torchvision import models as models
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, default_collate
+from torch.autograd import Variable
+from matplotlib import pyplot
+from sklearn.metrics import mean_squared_error
+import math
+import itertools   
+from self_attention_cv import ViT
+from sklearn.model_selection import KFold
+from functools import partial
+from timm.models.layers import trunc_normal_, DropPath
+from timm.models.registry import register_model
+from convnext import Block, LayerNorm
+from gconv_standalone import GConv
+
+
+print(os.cpu_count())
+batch_size=64
+
+results = {}
+torch.manual_seed(42)
+
+def reset_weights(m):
+  '''
+    Try resetting model weights to avoid
+    weight leakage.
+  '''
+  for layer in m.children():
+        if hasattr(layer, 'reset_parameters'):
+            print(f'Reset trainable parameters of layer = {layer}')
+            layer.reset_parameters()
+
+
+def Regression():
+    reg = nn.Sequential(
+          nn.Linear(45,384),
+          nn.Linear(384,1))
+    return reg
+
+class ConvNeXtIsotropic(nn.Module):
+    r""" ConvNeXt
+        A PyTorch impl of : `A ConvNet for the 2020s`  -
+        https://arxiv.org/pdf/2201.03545.pdf
+        Isotropic ConvNeXts (Section 3.3 in paper)
+
+    Args:
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 45
+        depth (tuple(int)): Number of blocks. Default: 18.
+        dims (int): Feature dimension. Default: 384
+        drop_path_rate (float): Stochastic depth rate. Default: 0.
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 0.
+        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
+    """
+    def __init__(self, in_chans=3, num_classes=45, 
+                 depth=18, dim=384, drop_path_rate=0., 
+                 layer_scale_init_value=5, head_init_scale=1.,
+                 ):
+        super().__init__()
+       
+        
+        self.stem = nn.Conv2d(in_chans, dim, kernel_size=16, stride=16)                              
+        
+        dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, depth)] 
+        
+        print(dim,dp_rates[17],layer_scale_init_value,depth)
+        self.blocks = nn.Sequential(*[Block(dim=dim, drop_path=dp_rates[i], 
+                                    layer_scale_init_value=layer_scale_init_value)
+                                   for i in range(depth)])
+
+        self.norm = LayerNorm(dim, eps=1e-6) # final norm layer
+        self.head = nn.Linear(dim, num_classes)
+
+        self.apply(self._init_weights)
+        self.head.weight.data.mul_(head_init_scale)
+        self.head.bias.data.mul_(head_init_scale)
+
+    def _init_weights(self, m):
+        if isinstance(m,(nn.Conv2d,nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            nn.init.constant_(m.bias, 0)
+
+    def forward_features(self, x):
+        
+        #print("model size 1",x.shape)
+        #x=torch.reshape(x,(108,3,144,144)).to(device)
+        #x = x.unsqueeze(0)
+        x = self.stem(x)
+        x = self.blocks(x)
+        #print("model size 2",x.shape)
+        x=torch.reshape(x,(384,5184,1))
+        y=self.norm(x.mean([-2, -1]))
+        #print("model size 3",y.shape)
+        return self.norm(x.mean([-2, -1])) # global average pooling, (N, C, H, W) -> (N, C)
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        #print("model size 4",x.shape)
+        return x
+
+def convnext_isotropic_base(pretrained=False, **kwargs):
+    model = ConvNeXtIsotropic(depth=18,dim=384,**kwargs).to(device)
+    if pretrained:
+        print("")
+    return model
+  
+class dev_mod(nn.Module):
+    def __init__(self):
+        super(dev_mod,self).__init__()
+        #devmod=convnext_isotropic_base().to(device)
+        self.d=ConvNeXtIsotropic().to(device)
+        
+        self.Regression=Regression().to(device)
+        
+    def forward(self,x):
+        #print("d",self.d)
+        x=self.d(x).to(device)
+        #print("regression input size:",x.size())
+        depr=self.Regression(x).to(device)
+        return depr
+
+
+#validation function
+def validate(model, test_dataloader):
+    print('Validating')
+    #model.eval()
+    val_running_loss = 0.0
+    val_running_loss2 = 0.0
+    num_iterations=0;
+    with torch.no_grad():
+        for i, data in tqdm(enumerate(test_dataloader,0),total=int(len(test_dataloader))):
+            num_iterations+=1;
+            
+            inputs, target = data[0].to(device), data[1].to(device)
+            #inputs=torch.reshape(inputs,(108,2304,3,3,3)).to(device)
+            #print("inputs.shape",inputs.shape)
+            inputs=torch.reshape(inputs,(64,3,144,144)).to(device)
+            #inputs=torch.reshape(inputs,(3,432,1,72,72)).to(device)
+            outputs = model(inputs).to(device)
+            target=torch.reshape(target,(64,1)).to(device)
+            #target=target.resize(108,1)
+            cri=nn.MSELoss().to(device)
+            loss=torch.sqrt(cri(outputs, target)).to(device)
+            loss2=MAE(outputs,target).to(device)
+            val_running_loss += loss.item()
+            val_running_loss2 += loss2.item()
+        val_rmse = (val_running_loss/num_iterations)
+        val_mae = (val_running_loss2/num_iterations)
+        #val_accuracy = 100. * val_running_correct/len(test_dataloader.dataset)
+        #print("len test loader dataset:", len(test_dataloader.dataset), "num_iterations*BS", num_iterations*108)
+        print(f'Val RMSE: {val_rmse:.4f}, Val MAE: {val_mae:.2f}')       
+        return val_rmse, val_mae
+
+# training function
+def fit(model, train_dataloader):
+    print('Training')
+    #model.train()
+    train_running_loss = 0.0
+    train_running_loss2 = 0.0 
+    num_iterations=0;
+    
+    for i, data in tqdm(enumerate(train_dataloader,0),total=int(len(train_dataloader))):
+        num_iterations+=1;
+        
+        inputs, target = data[0].to(device), data[1].to(device)
+        
+        #print("train inputs.shape",inputs.shape)
+        inputs=torch.reshape(inputs,(64,3,144,144)).to(device)
+        #inputs=torch.reshape(inputs,(3,432,1,72,72)).to(device)
+        
+        #print("train inputs.size",inputs.size(0))
+        optimizer.zero_grad()
+        #inputs = inputs.unsqueeze(0)
+        
+        outputs = model(inputs).to(device)
+        #print("outputs",outputs.shape)
+        #print("target",target.shape)
+        target=torch.reshape(target,(64,1)).to(device)
+        #target=target.resize(108,1)
+        cri=nn.MSELoss().to(device)
+        loss=torch.sqrt(cri(outputs, target)).to(device)
+        loss2 = MAE(outputs, target).to(device)
+        loss3=loss+loss2
+        loss3.backward(retain_graph=True)
+        #loss2.backward(retain_graph=True)
+        
+        optimizer.step()
+        train_running_loss += loss.item()
+        train_running_loss2 += loss2.item()     
+    train_rmse = (train_running_loss/num_iterations)
+    train_mae = (train_running_loss2/num_iterations)
+    #print("len train loader dataset:", len(train_dataloader.dataset), "num_iterations*BS", num_iterations*108)
+    print(f"Train RMSE: {train_rmse:.4f}, Train MAE: {train_mae:.2f}")      
+    return train_rmse, train_mae
+
+class NaturalImageDataset(Dataset):
+    def __init__(self, path, labels):
+        self.X = path
+        self.y = labels
+        self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize([144, 144]),
+                #albumentations.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
+                #albumentations.augmentations.transforms.GaussNoise (var_limit=(10.0, 50.0), mean=0, per_channel=True, always_apply=True, p=1),
+                #albumentations.augmentations.transforms.FancyPCA (alpha=0.1, always_apply=True, p=1),
+                #albumentations.RandomCrop(height=224, width=224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5])
+                
+            
+                #ToTensorV2() 
+            ])
+    def __len__(self):
+        return (len(self.X))
+    
+    def __getitem__(self, i):
+        path=(self.X[i])
+        image = Image.open(self.X[i])
+        convert_tensor=transforms.ToTensor()
+        image=convert_tensor(image)
+        image = self.transform(image)
+        image=image
+        ##model2=ViT(img_dim=256,in_channels=3,patch_dim=16,dim=512)
+        ####image=torch.rand(80,3,256,256)
+        ##image=model2(image)
+        #print(image.shape)
+        label = self.y[i]
+        
+        return torch.tensor(image, dtype=torch.float), torch.tensor(label, dtype=torch.float)
+print(torch.cuda.is_available())
+device = ('cuda:1' if torch.cuda.is_available() else 'cpu')
+#device='cpu'
+print(f"Computation device: {device}")
+
+# read the data.csv file and get the image paths and labels
+# read the data.csv file and get the image paths and labels
+files = os.path.join("/data/ghazal/AVEC2014FACE/new/train/train1/", "*.csv")
+files=glob.glob(files)
+df=pd.concat(map(pd.read_csv,files),ignore_index=True)
+
+X = df.image_path2.values
+y = df.target.values
+
+
+files = os.path.join("/data/ghazal/AVEC2014FACE/new/val/val1/", "*.csv")
+files=glob.glob(files)
+df2=pd.concat(map(pd.read_csv,files),ignore_index=True)
+X2 = df2.image_path2.values
+y2 = df2.target.values
+
+(xtrain, xtest, ytrain, ytest) = (X, X2, y, y2)
+
+train_data = NaturalImageDataset(xtrain, ytrain)
+test_data = NaturalImageDataset(xtest, ytest)
+
+trainloader = DataLoader(train_data, batch_size=64,shuffle=False,drop_last=True, num_workers=1,pin_memory=False)
+    
+testloader = DataLoader(test_data, batch_size=64,shuffle=False,drop_last=True, num_workers=1,pin_memory=False)
+    #print(len(train_data),len(test_data))
+model_ft = dev_mod().to(device)
+model_ft = model_ft.to(device)
+model_ft.apply(reset_weights)
+MAE = torch.nn.L1Loss()
+    #loss_function=torch.nn.MSELoss()
+optimizer = optim.Adam(model_ft.parameters(), lr=0.000001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
+train_rmse , train_mae = [], []
+val_rmse , val_mae = [], []
+start = time.time()
+
+for epoch in range(10):
+    print("Epoch:", epoch+1)
+        
+    train_epoch_loss, train_epoch_MAE = fit(model_ft, trainloader)
+    train_rmse.append(train_epoch_loss)
+    train_mae.append(train_epoch_MAE)
+    val_epoch_loss, val_epoch_MAE = validate(model_ft, testloader)
+    val_rmse.append(val_epoch_loss)
+    val_mae.append(val_epoch_MAE)
+    end = time.time()
+    print(f"{(end-start)/60:.3f} minutes")
+    # accuracy plots
+plt.figure(figsize=(10, 7))
+plt.plot(train_mae, color='green', label='train MAE')
+plt.plot(val_mae, color='blue', label='validataion MAE')
+plt.xlabel('Epochs')
+plt.ylabel('MAE')
+plt.legend()
+    #plt.savefig('/data/ghazal/Balanceddata/graphs/norm/accuracy4.png')
+plt.show()
+    # loss plots
+plt.figure(figsize=(10, 7))
+plt.plot(train_rmse, color='orange', label='train RMSE')
+plt.plot(val_rmse, color='red', label='validataion RMSE')
+plt.xlabel('Epochs')
+plt.ylabel('RMSE')
+plt.legend()
+    #plt.savefig('/data/ghazal/Balanceddata/graphs/norm/loss4.png')
+plt.show()
+#save the model to disk
+print('Saving model...')
+torch.save(model_ft.state_dict(), '/home/ghazal/data/Code/Experiments/Depression/14/testsgconvnext/model1.pth')
